@@ -483,7 +483,7 @@ class MontyPanel:
         """Draw the graph nodes colored by their voxels' accumulated match evidence.
 
         Annotated nodes are colored on a diverging scale symmetric around zero
-        (blue = negative evidence, red = positive), so the hue's meaning is stable
+        (blue = positive evidence, red = negative), so the hue's meaning is stable
         even though the limits track the accumulating values each step.
         Never-annotated nodes are drawn in yellow. The shared colorbar at the
         panel's right edge is created or rescaled to match.
@@ -496,7 +496,7 @@ class MontyPanel:
         annotated = ~np.isnan(evidence)
         vmax = max(float(np.max(np.abs(evidence[annotated]))), 1e-9)
         norm = mcolors.Normalize(vmin=-vmax, vmax=vmax)
-        cmap = plt.get_cmap("coolwarm")
+        cmap = plt.get_cmap("coolwarm_r")
         plain = pos[~annotated]
         if plain.size:
             ax.scatter(plain[:, 1], plain[:, 0], plain[:, 2], c="gold", s=2)
