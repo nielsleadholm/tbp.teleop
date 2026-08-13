@@ -10,9 +10,11 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import matplotlib.colors as mcolors
 import matplotlib.pyplot as plt
 import numpy as np
 import numpy.typing as npt
+from matplotlib.cm import ScalarMappable
 from matplotlib.gridspec import GridSpecFromSubplotSpec
 from tbp.monty.frameworks.models.two_d_sensor_module import TwoDSensorModule
 from tbp.monty.frameworks.sensors import SensorID
@@ -31,6 +33,8 @@ from tbp.teleop.helpers import (
 
 if TYPE_CHECKING:
     from matplotlib.axes import Axes
+    from matplotlib.colorbar import Colorbar
+    from matplotlib.colors import Colormap, Normalize
     from matplotlib.figure import Figure
     from tbp.monty.frameworks.agents import AgentID
     from tbp.monty.frameworks.models.abstract_monty_classes import (
@@ -175,7 +179,10 @@ class MontyPanel:
     the "Input Feature" corner inset stacked over it. During an exploratory step it
     draws the selected channel's buffered points (a flat edge cloud for a 2D sensor
     module, else a 3D cube with three head-on projections); during a matching step it
-    draws the displayed LM's most likely hypothesis graph and location marker; otherwise
+    draws the displayed LM's most likely hypothesis graph and location marker (a 3D
+    graph's nodes are colored by the accumulated match evidence annotated on their
+    voxels when the model carries such annotations, with a diverging colorbar centered
+    at zero); otherwise
     a centered placeholder. Axes are rebuilt only when the layout or projection changes
     (a matplotlib axis cannot switch between 2D and 3D in place), to avoid flicker. The
     selection and per-channel features come from a `ChannelView`.
@@ -200,6 +207,7 @@ class MontyPanel:
         self._projection: str | None = None
         self._proj_axes: list[Axes] = []
         self._inset: FeatureInset | None = None
+        self._evidence_cbar: Colorbar | None = None
 
     def draw_placeholder(self, message: str) -> None:
         """Draw a centered placeholder message in the Monty panel.
@@ -274,7 +282,7 @@ class MontyPanel:
         color = self._mlh_marker_color(mlh, lm.object_evidence_threshold)
         if is_3d(pos):
             ax = self._ensure_projection("3d")
-            self._show_mlh_3d(ax, mlh, pos, color)
+            self._show_mlh_3d(ax, mlh, graph, pos, color)
         else:
             ax = self._ensure_projection(None)
             self._show_mlh_2d(ax, mlh, graph, pos, color)
@@ -289,6 +297,7 @@ class MontyPanel:
 
     def _clear_axes(self) -> None:
         """Remove the main Monty axis and any projection axes below it."""
+        self._remove_evidence_colorbar()
         self._ax.remove()
         for ax in self._proj_axes:
             ax.remove()
@@ -396,18 +405,36 @@ class MontyPanel:
         return "red" if mlh["evidence"] > evidence_threshold else "gray"
 
     def _show_mlh_3d(
-        self, ax: Axes, mlh: dict, pos: npt.NDArray[np.float64], mlh_color: str
+        self,
+        ax: Axes,
+        mlh: dict,
+        graph: GraphObjectModel,
+        pos: npt.NDArray[np.float64],
+        mlh_color: str,
     ) -> None:
         """Render a 3D graph as a point cloud with the MLH location marked.
+
+        When the graph's model carries match-evidence annotations (accumulated on
+        its voxels during inference), each node is colored by its voxel's
+        accumulated evidence on a diverging scale centered at zero, with
+        never-annotated voxels in yellow. Without annotations the cloud is plain
+        black.
 
         Args:
             ax: The 3D Monty axis.
             mlh: The current most likely hypothesis.
+            graph: The MLH graph object model (the source of the match-evidence
+                annotations).
             pos: The graph node positions, shape `(N, 3)`.
             mlh_color: The MLH location marker color.
         """
         ax.cla()
-        ax.scatter(pos[:, 1], pos[:, 0], pos[:, 2], c="black", s=2)
+        evidence = self._match_evidence_sums(graph, len(pos))
+        if evidence is None:
+            self._remove_evidence_colorbar()
+            ax.scatter(pos[:, 1], pos[:, 0], pos[:, 2], c="black", s=2)
+        else:
+            self._scatter_match_evidence(ax, pos, evidence)
         ax.scatter(
             mlh["location"][1],
             mlh["location"][0],
@@ -418,6 +445,105 @@ class MontyPanel:
         ax.set_title(f"MLH ({mlh['graph_id']})")
         ax.set_axis_off()
         ax.set_aspect("equal")
+
+    @staticmethod
+    def _match_evidence_sums(
+        graph: GraphObjectModel, n: int
+    ) -> npt.NDArray[np.float64] | None:
+        """Return the per-node accumulated match evidence, or `None` if unavailable.
+
+        The model accumulates match evidence on its voxels during inference; each
+        graph node reads the running evidence sum of the voxel containing it. Nodes
+        whose voxel was never annotated read NaN.
+
+        Args:
+            graph: The graph object model to read annotations from.
+            n: The expected number of nodes (must match the positions drawn).
+
+        Returns:
+            The `(n,)` per-node evidence sums (NaN where unannotated), or `None`
+            when the model has no match-evidence API (e.g. a Monty checkout
+            without it), no annotations yet, or a mismatched node count.
+        """
+        get_match_evidence = getattr(graph, "get_match_evidence", None)
+        if get_match_evidence is None:
+            return None
+        evidence_sums, _counts = get_match_evidence()
+        evidence_sums = np.asarray(evidence_sums, dtype=float)
+        if evidence_sums.shape != (n,) or np.isnan(evidence_sums).all():
+            return None
+        return evidence_sums
+
+    def _scatter_match_evidence(
+        self,
+        ax: Axes,
+        pos: npt.NDArray[np.float64],
+        evidence: npt.NDArray[np.float64],
+    ) -> None:
+        """Draw the graph nodes colored by their voxels' accumulated match evidence.
+
+        Annotated nodes are colored on a diverging scale symmetric around zero
+        (blue = negative evidence, red = positive), so the hue's meaning is stable
+        even though the limits track the accumulating values each step.
+        Never-annotated nodes are drawn in yellow. The shared colorbar at the
+        panel's right edge is created or rescaled to match.
+
+        Args:
+            ax: The 3D Monty axis.
+            pos: The graph node positions, shape `(N, 3)`.
+            evidence: The `(N,)` per-node evidence sums, NaN where unannotated.
+        """
+        annotated = ~np.isnan(evidence)
+        vmax = max(float(np.max(np.abs(evidence[annotated]))), 1e-9)
+        norm = mcolors.Normalize(vmin=-vmax, vmax=vmax)
+        cmap = plt.get_cmap("coolwarm")
+        plain = pos[~annotated]
+        if plain.size:
+            ax.scatter(plain[:, 1], plain[:, 0], plain[:, 2], c="gold", s=2)
+        matched = pos[annotated]
+        ax.scatter(
+            matched[:, 1],
+            matched[:, 0],
+            matched[:, 2],
+            c=cmap(norm(evidence[annotated])),
+            s=6,
+        )
+        self._update_evidence_colorbar(cmap, norm)
+
+    def _update_evidence_colorbar(self, cmap: Colormap, norm: Normalize) -> None:
+        """Create or rescale the match-evidence colorbar at the panel's right edge.
+
+        The colorbar lives on its own slim figure-level axis so it survives the
+        3D axis being cleared every frame; rescaling mutates the existing
+        mappable's norm, which the colorbar tracks through its callbacks.
+
+        Args:
+            cmap: The colormap the node colors were drawn with.
+            norm: This frame's symmetric normalization.
+        """
+        if self._evidence_cbar is not None:
+            self._evidence_cbar.mappable.set_norm(norm)
+            return
+        bbox = self.spec.get_position(self.fig)
+        height = (bbox.y1 - bbox.y0) * 0.5
+        rect = (
+            bbox.x1 - 0.008,
+            bbox.y0 + (bbox.y1 - bbox.y0 - height) / 2,
+            0.008,
+            height,
+        )
+        cax = self.fig.add_axes(rect)
+        self._evidence_cbar = self.fig.colorbar(
+            ScalarMappable(norm=norm, cmap=cmap), cax=cax
+        )
+        self._evidence_cbar.set_label("match evidence", fontsize=8)
+        cax.tick_params(labelsize=7)
+
+    def _remove_evidence_colorbar(self) -> None:
+        """Remove the match-evidence colorbar (when leaving the annotated 3D view)."""
+        if self._evidence_cbar is not None:
+            self._evidence_cbar.remove()
+            self._evidence_cbar = None
 
     def _show_mlh_2d(
         self,

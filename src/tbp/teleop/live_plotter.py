@@ -61,7 +61,10 @@ class LivePlotter(Plotter):
       inset showing the live feature on that channel (a 2D edge, a 3D surface, or, for a
       learning-module channel, the name of the object being passed). During an
       exploratory step the main graph is the channel's buffer points; during a
-      matching step it is the most likely hypothesis graph plus its location marker.
+      matching step it is the most likely hypothesis graph plus its location marker,
+      with 3D graph nodes colored by the match evidence accumulated on their voxels
+      (when the model annotates it) so the annotation can be watched evolving over
+      the episode.
     - Details: during an exploratory step, a per-channel stack of the other channels'
       buffers, each carrying the same "Input Feature" inset as the Monty section; during
       a matching step, the displayed LM's per-object evidence and number-of-hypotheses
